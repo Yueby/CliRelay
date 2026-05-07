@@ -97,7 +97,7 @@ jobs:
               mkdir -p "$(dirname "$BODY_SIZE_CONF")"
               cat > "$BODY_SIZE_CONF" <<'EOF'
 # Managed by CliRelay GitHub Actions deploy workflow
-client_max_body_size 50m;
+client_max_body_size 2000m;
 EOF
               if command -v nginx >/dev/null 2>&1; then
                 nginx -t
