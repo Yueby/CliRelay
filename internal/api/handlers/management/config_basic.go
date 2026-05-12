@@ -366,10 +366,18 @@ func (h *Handler) GetConfigYAML(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "read_failed", "message": err.Error()})
 		return
 	}
+	// When the SQLite config store is active, DB-backed sections have been stripped
+	// from the YAML file. Merge them back from the in-memory config so the
+	// management panel can read and edit them.
+	if usage.ConfigStoreAvailable() {
+		h.mu.Lock()
+		cfg := h.cfg
+		h.mu.Unlock()
+		data = usage.MergeDBSettingsIntoYAML(data, cfg)
+	}
 	c.Header("Content-Type", "application/yaml; charset=utf-8")
 	c.Header("Cache-Control", "no-store")
 	c.Header("X-Content-Type-Options", "nosniff")
-	// Write raw bytes as-is
 	_, _ = c.Writer.Write(data)
 }
 

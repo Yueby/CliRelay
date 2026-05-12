@@ -1662,8 +1662,11 @@ func (h *Handler) PutCodexKeys(c *gin.Context) {
 	for i := range arr {
 		entry := arr[i]
 		normalizeCodexKey(&entry)
-		if entry.BaseURL == "" {
+		if strings.TrimSpace(entry.APIKey) == "" {
 			continue
+		}
+		if entry.BaseURL == "" {
+			entry.BaseURL = "https://chatgpt.com/backend-api/codex"
 		}
 		filtered = append(filtered, entry)
 	}
