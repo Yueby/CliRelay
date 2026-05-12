@@ -375,17 +375,19 @@ func (h *Handler) PatchAPIKeyEntry(c *gin.Context) {
 	if body.Value.Key != nil {
 		trimmed := strings.TrimSpace(*body.Value.Key)
 		if trimmed == "" {
-			if err := usage.DeleteAPIKey(targetKey); err != nil {
-				c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-				return
-			}
-			h.refreshAPIKeyCache()
-			c.JSON(200, gin.H{"status": "ok"})
+			c.JSON(http.StatusBadRequest, gin.H{"error": "key is required"})
 			return
 		}
 		// Key change: delete old, insert new
 		if trimmed != targetKey {
-			_ = usage.DeleteAPIKey(targetKey)
+			if existing := usage.GetAPIKey(trimmed); existing != nil {
+				c.JSON(http.StatusConflict, gin.H{"error": "api key already exists"})
+				return
+			}
+			if err := usage.DeleteAPIKey(targetKey); err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+				return
+			}
 		}
 		entry.Key = trimmed
 	}
@@ -1213,6 +1215,7 @@ func (h *Handler) PutOpenAICompat(c *gin.Context) {
 func (h *Handler) PatchOpenAICompat(c *gin.Context) {
 	type openAICompatPatch struct {
 		Name          *string                             `json:"name"`
+		Disabled      *bool                               `json:"disabled"`
 		Prefix        *string                             `json:"prefix"`
 		BaseURL       *string                             `json:"base-url"`
 		APIKeyEntries *[]config.OpenAICompatibilityAPIKey `json:"api-key-entries"`
@@ -1249,6 +1252,9 @@ func (h *Handler) PatchOpenAICompat(c *gin.Context) {
 	entry := h.cfg.OpenAICompatibility[targetIndex]
 	if body.Value.Name != nil {
 		entry.Name = strings.TrimSpace(*body.Value.Name)
+	}
+	if body.Value.Disabled != nil {
+		entry.Disabled = *body.Value.Disabled
 	}
 	if body.Value.Prefix != nil {
 		entry.Prefix = strings.TrimSpace(*body.Value.Prefix)

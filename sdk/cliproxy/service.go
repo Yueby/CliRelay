@@ -436,6 +436,29 @@ func openAICompatInfoFromAuth(a *coreauth.Auth) (providerKey string, compatName 
 	return "", "", false
 }
 
+func openAICompatAuthEntryActive(compat *config.OpenAICompatibility, auth *coreauth.Auth) bool {
+	if compat == nil || compat.Disabled {
+		return false
+	}
+	if len(compat.APIKeyEntries) == 0 {
+		return true
+	}
+	authKey := ""
+	if auth != nil && auth.Attributes != nil {
+		authKey = strings.TrimSpace(auth.Attributes["api_key"])
+	}
+	for i := range compat.APIKeyEntries {
+		entry := &compat.APIKeyEntries[i]
+		if entry.Disabled {
+			continue
+		}
+		if strings.TrimSpace(entry.APIKey) == authKey {
+			return true
+		}
+	}
+	return false
+}
+
 func (s *Service) ensureExecutorsForAuth(a *coreauth.Auth) {
 	s.ensureExecutorsForAuthWithMode(a, false)
 }
@@ -793,6 +816,8 @@ func (s *Service) registerModelsForAuth(ctx context.Context, a *coreauth.Auth) {
 	if authKind == "" {
 		if kind, _ := a.AccountInfo(); strings.EqualFold(kind, "api_key") {
 			authKind = "apikey"
+		} else if strings.EqualFold(kind, "oauth") {
+			authKind = "oauth"
 		}
 	}
 	if a.Attributes != nil {
@@ -873,6 +898,7 @@ func (s *Service) registerModelsForAuth(ctx context.Context, a *coreauth.Auth) {
 				excluded = entry.ExcludedModels
 			}
 		}
+		models = appendOAuthProviderModelConfigs(models, provider, authKind)
 		models = applyExcludedModels(models, excluded)
 	case "bedrock":
 		models = registry.GetBedrockModels()
@@ -952,6 +978,10 @@ func (s *Service) registerModelsForAuth(ctx context.Context, a *coreauth.Auth) {
 			for i := range s.cfg.OpenAICompatibility {
 				compat := &s.cfg.OpenAICompatibility[i]
 				if strings.EqualFold(compat.Name, compatName) {
+					if !openAICompatAuthEntryActive(compat, a) {
+						GlobalModelRegistry().UnregisterClient(a.ID)
+						return
+					}
 					// Convert compatibility models to registry models
 					ms := make([]*ModelInfo, 0, len(compat.Models))
 					for j := range compat.Models {
@@ -1457,6 +1487,95 @@ func buildClaudeConfigModels(entry *config.ClaudeKey) []*ModelInfo {
 		return nil
 	}
 	return buildConfigModels(entry.Models, "anthropic", "claude")
+}
+
+func appendOAuthProviderModelConfigs(models []*ModelInfo, provider, authKind string) []*ModelInfo {
+	if !strings.EqualFold(strings.TrimSpace(authKind), "oauth") {
+		return models
+	}
+	provider = strings.ToLower(strings.TrimSpace(provider))
+	if provider == "" {
+		return models
+	}
+	owners := modelConfigOwnerAliases(provider)
+	if len(owners) == 0 {
+		return models
+	}
+
+	out := append([]*ModelInfo(nil), models...)
+	seen := make(map[string]struct{}, len(out))
+	for _, model := range out {
+		if model == nil {
+			continue
+		}
+		id := strings.ToLower(strings.TrimSpace(model.ID))
+		if id != "" {
+			seen[id] = struct{}{}
+		}
+	}
+
+	now := time.Now().Unix()
+	for _, row := range internalusage.ListModelConfigs() {
+		modelID := strings.TrimSpace(row.ModelID)
+		if modelID == "" || !row.Enabled || !oauthProviderModelConfigSourceAllowed(row.Source) {
+			continue
+		}
+		if _, ok := owners[normalizeModelConfigOwner(row.OwnedBy)]; !ok {
+			continue
+		}
+		key := strings.ToLower(modelID)
+		if _, exists := seen[key]; exists {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, &ModelInfo{
+			ID:          modelID,
+			Object:      "model",
+			Created:     now,
+			OwnedBy:     strings.TrimSpace(row.OwnedBy),
+			Type:        provider,
+			DisplayName: strings.TrimSpace(row.Description),
+			Description: strings.TrimSpace(row.Description),
+			UserDefined: true,
+		})
+	}
+	return out
+}
+
+func oauthProviderModelConfigSourceAllowed(source string) bool {
+	switch strings.ToLower(strings.TrimSpace(source)) {
+	case "user", "seed", "openrouter":
+		return true
+	default:
+		return false
+	}
+}
+
+func modelConfigOwnerAliases(provider string) map[string]struct{} {
+	provider = normalizeModelConfigOwner(provider)
+	if provider == "" {
+		return nil
+	}
+	values := []string{provider}
+	switch provider {
+	case "claude":
+		values = append(values, "anthropic", "claude-code")
+	case "gemini", "gemini-cli", "vertex":
+		values = append(values, "google")
+	case "codex":
+		values = append(values, "openai")
+	}
+	out := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		if value = normalizeModelConfigOwner(value); value != "" {
+			out[value] = struct{}{}
+		}
+	}
+	return out
+}
+
+func normalizeModelConfigOwner(value string) string {
+	return strings.ToLower(strings.Join(strings.Fields(strings.TrimSpace(value)), "-"))
 }
 
 func buildBedrockConfigModels(entry *config.BedrockKey) []*ModelInfo {

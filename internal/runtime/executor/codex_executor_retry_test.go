@@ -60,6 +60,47 @@ func TestParseCodexRetryAfter(t *testing.T) {
 	})
 }
 
+func TestNewCodexStatusErrCarriesActiveLimitWindow(t *testing.T) {
+	t.Run("primary five hour window", func(t *testing.T) {
+		body := []byte(`{"error":{"type":"usage_limit_reached","resets_at":1778566866,"resets_in_seconds":4438}}`)
+		headers := http.Header{
+			"X-Codex-Active-Limit":                  []string{"premium"},
+			"X-Codex-Primary-Used-Percent":          []string{"100"},
+			"X-Codex-Primary-Window-Minutes":        []string{"300"},
+			"X-Codex-Primary-Reset-After-Seconds":   []string{"4439"},
+			"X-Codex-Primary-Reset-At":              []string{"1778566866"},
+			"X-Codex-Secondary-Used-Percent":        []string{"16"},
+			"X-Codex-Secondary-Window-Minutes":      []string{"10080"},
+			"X-Codex-Secondary-Reset-After-Seconds": []string{"591239"},
+			"X-Codex-Secondary-Reset-At":            []string{"1779153666"},
+		}
+
+		err := newCodexStatusErr(http.StatusTooManyRequests, body, headers)
+		window, minutes := err.QuotaWindow()
+		if window != "5h" || minutes != 300 {
+			t.Fatalf("QuotaWindow() = %q, %d; want 5h, 300", window, minutes)
+		}
+	})
+
+	t.Run("secondary weekly window", func(t *testing.T) {
+		body := []byte(`{"error":{"type":"usage_limit_reached","resets_at":1779153666,"resets_in_seconds":591239}}`)
+		headers := http.Header{
+			"X-Codex-Primary-Used-Percent":     []string{"42"},
+			"X-Codex-Primary-Window-Minutes":   []string{"300"},
+			"X-Codex-Primary-Reset-At":         []string{"1778566866"},
+			"X-Codex-Secondary-Used-Percent":   []string{"100"},
+			"X-Codex-Secondary-Window-Minutes": []string{"10080"},
+			"X-Codex-Secondary-Reset-At":       []string{"1779153666"},
+		}
+
+		err := newCodexStatusErr(http.StatusTooManyRequests, body, headers)
+		window, minutes := err.QuotaWindow()
+		if window != "week" || minutes != 10080 {
+			t.Fatalf("QuotaWindow() = %q, %d; want week, 10080", window, minutes)
+		}
+	})
+}
+
 func TestParseCodexQuotaProbe(t *testing.T) {
 	t.Run("does not recover when primary window is exhausted", func(t *testing.T) {
 		primaryResetAt := time.Date(2030, 1, 1, 1, 0, 0, 0, time.UTC).Unix()
@@ -92,6 +133,24 @@ func TestParseCodexQuotaProbe(t *testing.T) {
 		}
 		if !got.NextRecoverAt.Equal(time.Unix(resetAt, 0)) {
 			t.Fatalf("NextRecoverAt = %v, want %v", got.NextRecoverAt, time.Unix(resetAt, 0))
+		}
+	})
+
+	t.Run("prefers exhausted window reset when explicit limit reached", func(t *testing.T) {
+		primaryResetAt := time.Date(2030, 1, 1, 1, 0, 0, 0, time.UTC).Unix()
+		secondaryResetAt := time.Date(2030, 1, 1, 6, 0, 0, 0, time.UTC).Unix()
+		body := []byte(`{"rate_limit":{"allowed":false,"limit_reached":true,"primary_window":{"used_percent":1,"reset_at":` + itoa(primaryResetAt) + `},"secondary_window":{"used_percent":100,"reset_at":` + itoa(secondaryResetAt) + `}}}`)
+
+		got := parseCodexQuotaProbe(body)
+		if got == nil {
+			t.Fatal("expected quota probe result, got nil")
+		}
+		if got.Recovered {
+			t.Fatal("Recovered = true, want false while limit_reached is true")
+		}
+		wantRecoverAt := time.Unix(secondaryResetAt, 0)
+		if !got.NextRecoverAt.Equal(wantRecoverAt) {
+			t.Fatalf("NextRecoverAt = %v, want %v", got.NextRecoverAt, wantRecoverAt)
 		}
 	})
 }
