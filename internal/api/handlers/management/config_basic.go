@@ -344,6 +344,8 @@ func (h *Handler) PutConfigYAML(c *gin.Context) {
 		usage.PersistRuntimeSettingsPresentInYAML(newCfg, body)
 		usage.MigrateRuntimeSettingsFromConfig(newCfg, h.configFilePath)
 		usage.ApplyStoredRuntimeSettings(newCfg)
+		usage.ApplyStoredRoutingConfig(newCfg)
+		usage.ApplyStoredProxyPool(newCfg)
 	}
 	h.cfg = newCfg
 	c.JSON(http.StatusOK, gin.H{"ok": true, "changed": []string{"config"}})
@@ -351,6 +353,9 @@ func (h *Handler) PutConfigYAML(c *gin.Context) {
 
 // GetConfigYAML returns the raw config.yaml file bytes without re-encoding.
 // It preserves comments and original formatting/styles.
+// When the SQLite config store is active, DB-backed sections (payload, routing,
+// api-keys, etc.) are merged back into the returned YAML so the management panel
+// can read and edit them seamlessly.
 func (h *Handler) GetConfigYAML(c *gin.Context) {
 	data, err := os.ReadFile(h.configFilePath)
 	if err != nil {

@@ -1259,6 +1259,9 @@ func (h *Handler) PatchOpenAICompat(c *gin.Context) {
 	if body.Value.Prefix != nil {
 		entry.Prefix = strings.TrimSpace(*body.Value.Prefix)
 	}
+	if body.Value.Disabled != nil {
+		entry.Disabled = *body.Value.Disabled
+	}
 	if body.Value.BaseURL != nil {
 		trimmed := strings.TrimSpace(*body.Value.BaseURL)
 		if trimmed == "" {
@@ -1287,7 +1290,7 @@ func (h *Handler) PatchOpenAICompat(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	h.persist(c)
+	h.persistRuntimeSetting(c, usage.RuntimeSettingOpenAICompatibility, h.cfg.OpenAICompatibility)
 }
 
 func (h *Handler) DeleteOpenAICompat(c *gin.Context) {

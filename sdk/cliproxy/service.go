@@ -954,6 +954,9 @@ func (s *Service) registerModelsForAuth(ctx context.Context, a *coreauth.Auth) {
 			}
 			for i := range s.cfg.OpenAICompatibility {
 				compat := &s.cfg.OpenAICompatibility[i]
+				if compat.Disabled {
+					continue
+				}
 				if strings.EqualFold(compat.Name, compatName) {
 					// Convert compatibility models to registry models
 					ms := make([]*ModelInfo, 0, len(compat.Models))
