@@ -553,6 +553,10 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 	}
 	auth.EnsureIndex()
 	snapshot := auth.Clone()
+	if previous != nil {
+		preserveRuntimeFields(snapshot, previous)
+		preserveAvailabilityRuntimeForUpdate(snapshot, previous, time.Now())
+	}
 	m.auths[auth.ID] = snapshot
 	m.mu.Unlock()
 	if err := m.persist(ctx, snapshot); err != nil {
@@ -568,6 +572,33 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 	}
 	m.rebuildAPIKeyModelAliasFromRuntimeConfig()
 	m.hook.OnAuthUpdated(ctx, snapshot.Clone())
+	return snapshot.Clone(), nil
+}
+
+// Delete removes an auth entry from the runtime manager and persistence store.
+func (m *Manager) Delete(ctx context.Context, id string) (*Auth, error) {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return nil, nil
+	}
+	m.mu.Lock()
+	previous, ok := m.auths[id]
+	if !ok || previous == nil {
+		m.mu.Unlock()
+		return nil, nil
+	}
+	snapshot := previous.Clone()
+	delete(m.auths, id)
+	m.mu.Unlock()
+
+	if err := m.deletePersist(ctx, snapshot); err != nil {
+		m.mu.Lock()
+		m.auths[id] = snapshot
+		m.mu.Unlock()
+		m.rebuildAPIKeyModelAliasFromRuntimeConfig()
+		return nil, err
+	}
+	m.rebuildAPIKeyModelAliasFromRuntimeConfig()
 	return snapshot.Clone(), nil
 }
 
@@ -922,12 +953,13 @@ func hasRequestedModelMetadata(meta map[string]any) bool {
 	}
 }
 
+// Explicit single-pick controls pin execution to one auth; route groups only scope candidates.
 func isSinglePickRouteRequest(meta map[string]any) bool {
-	if routeGroupFromMetadata(meta) != "" {
-		return true
-	}
 	if len(meta) == 0 {
 		return false
+	}
+	if pinnedAuthIDFromMetadata(meta) != "" {
+		return true
 	}
 	raw, ok := meta[cliproxyexecutor.SinglePickMetadataKey]
 	if !ok || raw == nil {
@@ -1444,18 +1476,28 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 		if result.Success {
 			if result.Model != "" {
 				state := ensureModelState(auth, result.Model)
-				resetModelState(state, now)
-				updateAggregatedAvailability(auth, now)
-				if !hasModelError(auth, now) {
-					auth.LastError = nil
-					auth.StatusMessage = ""
-					auth.Status = StatusActive
+				if activeModelQuotaCooldown(state, now) {
+					updateAggregatedAvailability(auth, now)
+					auth.UpdatedAt = now
+				} else {
+					resetModelState(state, now)
+					updateAggregatedAvailability(auth, now)
+					if !hasModelError(auth, now) {
+						auth.LastError = nil
+						auth.StatusMessage = ""
+						auth.Status = StatusActive
+					}
+					auth.UpdatedAt = now
+					shouldResumeModel = true
+					clearModelQuota = true
 				}
-				auth.UpdatedAt = now
-				shouldResumeModel = true
-				clearModelQuota = true
 			} else {
-				clearAuthStateOnSuccess(auth, now)
+				if activeAuthQuotaCooldown(auth, now) {
+					updateAggregatedAvailability(auth, now)
+					auth.UpdatedAt = now
+				} else {
+					clearAuthStateOnSuccess(auth, now)
+				}
 			}
 		} else {
 			if result.Model != "" {
@@ -1647,6 +1689,62 @@ func updateAggregatedAvailability(auth *Auth, now time.Time) {
 		auth.Quota.NextRecoverAt = time.Time{}
 		auth.Quota.BackoffLevel = 0
 	}
+}
+
+func activeModelQuotaCooldown(state *ModelState, now time.Time) bool {
+	if state == nil {
+		return false
+	}
+	return activeQuotaCooldown(state.Quota, state.NextRetryAfter, now)
+}
+
+func activeAuthQuotaCooldown(auth *Auth, now time.Time) bool {
+	if auth == nil {
+		return false
+	}
+	return activeQuotaCooldown(auth.Quota, auth.NextRetryAfter, now)
+}
+
+func activeQuotaCooldown(quota QuotaState, retryAfter time.Time, now time.Time) bool {
+	if !quota.Exceeded {
+		return false
+	}
+	if !quota.NextRecoverAt.IsZero() {
+		return quota.NextRecoverAt.After(now)
+	}
+	return !retryAfter.IsZero() && retryAfter.After(now)
+}
+
+func activeModelRuntimeState(state *ModelState, now time.Time) bool {
+	if state == nil {
+		return false
+	}
+	if activeModelQuotaCooldown(state, now) {
+		return true
+	}
+	if state.Unavailable {
+		return state.NextRetryAfter.IsZero() || state.NextRetryAfter.After(now)
+	}
+	if state.Status == StatusError && state.LastError != nil {
+		return state.NextRetryAfter.IsZero() || state.NextRetryAfter.After(now)
+	}
+	return false
+}
+
+func activeAuthRuntimeState(auth *Auth, now time.Time) bool {
+	if auth == nil {
+		return false
+	}
+	if activeAuthQuotaCooldown(auth, now) {
+		return true
+	}
+	if auth.Unavailable {
+		return auth.NextRetryAfter.IsZero() || auth.NextRetryAfter.After(now)
+	}
+	if auth.Status == StatusError && auth.LastError != nil {
+		return auth.NextRetryAfter.IsZero() || auth.NextRetryAfter.After(now)
+	}
+	return false
 }
 
 func hasModelError(auth *Auth, now time.Time) bool {
@@ -2233,6 +2331,24 @@ func (m *Manager) persist(ctx context.Context, auth *Auth) error {
 	return err
 }
 
+func (m *Manager) deletePersist(ctx context.Context, auth *Auth) error {
+	if m.store == nil || auth == nil || auth.ID == "" {
+		return nil
+	}
+	if shouldSkipPersist(ctx) {
+		return nil
+	}
+	if auth.Attributes != nil {
+		if v := strings.ToLower(strings.TrimSpace(auth.Attributes["runtime_only"])); v == "true" {
+			return nil
+		}
+	}
+	if auth.Metadata == nil {
+		return nil
+	}
+	return m.store.Delete(ctx, auth.ID)
+}
+
 // StartAutoRefresh launches a background loop that evaluates auth freshness
 // every few seconds and triggers refresh operations when required.
 // Only one loop is kept alive; starting a new one cancels the previous run.
@@ -2319,6 +2435,9 @@ func (m *Manager) snapshotAuths() []*Auth {
 
 func (m *Manager) shouldRefresh(a *Auth, now time.Time) bool {
 	if a == nil {
+		return false
+	}
+	if a.Disabled || a.Status == StatusDisabled {
 		return false
 	}
 	if !a.NextRefreshAfter.IsZero() && now.Before(a.NextRefreshAfter) {
@@ -2732,6 +2851,75 @@ func preserveRuntimeFields(dst *Auth, src *Auth) {
 	if dst.FileName == "" {
 		dst.FileName = src.FileName
 	}
+}
+
+func preserveAvailabilityRuntimeForUpdate(dst *Auth, src *Auth, now time.Time) {
+	if dst == nil || src == nil {
+		return
+	}
+	if dst.Disabled || dst.Status == StatusDisabled {
+		return
+	}
+
+	preservedModelState := false
+	if len(src.ModelStates) > 0 {
+		if dst.ModelStates == nil {
+			dst.ModelStates = make(map[string]*ModelState, len(src.ModelStates))
+		}
+		for model, srcState := range src.ModelStates {
+			if !shouldPreserveModelRuntimeState(dst.ModelStates[model], srcState, now) {
+				continue
+			}
+			dst.ModelStates[model] = srcState.Clone()
+			preservedModelState = true
+		}
+	}
+
+	if preservedModelState {
+		updateAggregatedAvailability(dst, now)
+		if dst.Status == "" || dst.Status == StatusUnknown || dst.Status == StatusActive {
+			dst.Status = src.Status
+		}
+		if dst.StatusMessage == "" {
+			dst.StatusMessage = src.StatusMessage
+		}
+		if dst.LastError == nil {
+			dst.LastError = cloneError(src.LastError)
+		}
+	}
+
+	if !shouldPreserveAuthRuntimeState(dst, src, now) {
+		return
+	}
+	dst.Unavailable = src.Unavailable
+	dst.Status = src.Status
+	dst.StatusMessage = src.StatusMessage
+	dst.LastError = cloneError(src.LastError)
+	dst.Quota = src.Quota
+	dst.NextRetryAfter = src.NextRetryAfter
+}
+
+func shouldPreserveModelRuntimeState(dst *ModelState, src *ModelState, now time.Time) bool {
+	if !activeModelRuntimeState(src, now) {
+		return false
+	}
+	if dst == nil {
+		return true
+	}
+	if dst.Status == StatusDisabled {
+		return false
+	}
+	return !activeModelRuntimeState(dst, now)
+}
+
+func shouldPreserveAuthRuntimeState(dst *Auth, src *Auth, now time.Time) bool {
+	if !activeAuthRuntimeState(src, now) {
+		return false
+	}
+	if dst.Disabled || dst.Status == StatusDisabled {
+		return false
+	}
+	return !activeAuthRuntimeState(dst, now)
 }
 
 func canKeepRefreshFailureActive(auth *Auth, now time.Time) bool {

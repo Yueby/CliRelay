@@ -17,11 +17,17 @@ type channelDescriptor struct {
 	Prefix            string
 	Source            string
 	Disabled          bool
+	DisabledAuthority int
 	DefaultTags       []string
 	CustomTags        []string
 	HiddenDefaultTags []string
 	DisplayTags       []string
 }
+
+const (
+	channelDisabledAuthorityRuntime = 1
+	channelDisabledAuthorityConfig  = 2
+)
 
 type channelGroupItem struct {
 	Name           string                      `json:"name"`
@@ -30,6 +36,7 @@ type channelGroupItem struct {
 	Priority       int                         `json:"priority,omitempty"`
 	Implicit       bool                        `json:"implicit"`
 	Prefixes       []string                    `json:"prefixes,omitempty"`
+	Tags           []string                    `json:"tags,omitempty"`
 	Channels       []string                    `json:"channels,omitempty"`
 	ChannelDetails []channelGroupChannelDetail `json:"channel-details,omitempty"`
 	AllowedModels  []string                    `json:"allowed-models,omitempty"`
@@ -38,7 +45,7 @@ type channelGroupItem struct {
 
 func collectChannelDescriptors(cfg *config.Config, auths []*coreauth.Auth) []channelDescriptor {
 	items := make([]channelDescriptor, 0)
-	push := func(name, prefix, source string, disabled bool, tags authTagPayload) {
+	push := func(name, prefix, source string, disabled bool, disabledAuthority int, tags authTagPayload) {
 		name = strings.TrimSpace(name)
 		prefix = internalrouting.NormalizeGroupName(prefix)
 		if name == "" && prefix == "" {
@@ -49,6 +56,7 @@ func collectChannelDescriptors(cfg *config.Config, auths []*coreauth.Auth) []cha
 			Prefix:            prefix,
 			Source:            source,
 			Disabled:          disabled,
+			DisabledAuthority: disabledAuthority,
 			DefaultTags:       append([]string{}, tags.DefaultTags...),
 			CustomTags:        append([]string{}, tags.CustomTags...),
 			HiddenDefaultTags: append([]string{}, tags.HiddenDefaultTags...),
@@ -58,19 +66,25 @@ func collectChannelDescriptors(cfg *config.Config, auths []*coreauth.Auth) []cha
 
 	if cfg != nil {
 		for _, entry := range cfg.GeminiKey {
-			push(entry.Name, entry.Prefix, "gemini", false, buildAuthTagPayloadFromValues("gemini", nil))
+			push(entry.Name, entry.Prefix, "gemini", providerExcludesAllModels(entry.ExcludedModels), channelDisabledAuthorityConfig, buildAuthTagPayloadFromValues("gemini", nil))
 		}
 		for _, entry := range cfg.ClaudeKey {
-			push(entry.Name, entry.Prefix, "claude", false, buildAuthTagPayloadFromValues("claude", nil))
+			push(entry.Name, entry.Prefix, "claude", providerExcludesAllModels(entry.ExcludedModels), channelDisabledAuthorityConfig, buildAuthTagPayloadFromValues("claude", nil))
+		}
+		for _, entry := range cfg.BedrockKey {
+			push(entry.Name, entry.Prefix, "bedrock", providerExcludesAllModels(entry.ExcludedModels), channelDisabledAuthorityConfig, buildAuthTagPayloadFromValues("bedrock", nil))
 		}
 		for _, entry := range cfg.CodexKey {
-			push(entry.Name, entry.Prefix, "codex", false, buildAuthTagPayloadFromValues("codex", nil))
+			push(entry.Name, entry.Prefix, "codex", providerExcludesAllModels(entry.ExcludedModels), channelDisabledAuthorityConfig, buildAuthTagPayloadFromValues("codex", nil))
+		}
+		for _, entry := range cfg.OpenCodeGoKey {
+			push(entry.Name, entry.Prefix, "opencode-go", providerExcludesAllModels(entry.ExcludedModels), channelDisabledAuthorityConfig, buildAuthTagPayloadFromValues("opencode-go", nil))
 		}
 		for _, entry := range cfg.VertexCompatAPIKey {
-			push("", entry.Prefix, "vertex", false, buildAuthTagPayloadFromValues("vertex", nil))
+			push("", entry.Prefix, "vertex", false, channelDisabledAuthorityConfig, buildAuthTagPayloadFromValues("vertex", nil))
 		}
 		for _, entry := range cfg.OpenAICompatibility {
-			push(entry.Name, entry.Prefix, "openai", entry.Disabled, buildAuthTagPayloadFromValues("openai", nil))
+			push(entry.Name, entry.Prefix, "openai", entry.Disabled, channelDisabledAuthorityConfig, buildAuthTagPayloadFromValues("openai", nil))
 		}
 	}
 
@@ -82,12 +96,39 @@ func collectChannelDescriptors(cfg *config.Config, auths []*coreauth.Auth) []cha
 			auth.ChannelName(),
 			auth.Prefix,
 			auth.Provider,
-			auth.Disabled || auth.Status == coreauth.StatusDisabled,
+			authChannelDisabled(auth),
+			channelDisabledAuthorityRuntime,
 			buildAuthTagPayload(auth),
 		)
 	}
 
 	return items
+}
+
+func providerExcludesAllModels(excludedModels []string) bool {
+	for _, model := range excludedModels {
+		if strings.TrimSpace(model) == "*" {
+			return true
+		}
+	}
+	return false
+}
+
+func authExcludesAllModels(auth *coreauth.Auth) bool {
+	if auth == nil || auth.Attributes == nil {
+		return false
+	}
+	if !strings.EqualFold(strings.TrimSpace(auth.Attributes["auth_kind"]), "apikey") {
+		return false
+	}
+	return providerExcludesAllModels(strings.Split(auth.Attributes["excluded_models"], ","))
+}
+
+func authChannelDisabled(auth *coreauth.Auth) bool {
+	if auth == nil {
+		return false
+	}
+	return auth.Disabled || auth.Status == coreauth.StatusDisabled || authExcludesAllModels(auth)
 }
 
 func includeAuthInChannelGroups(auth *coreauth.Auth) bool {
@@ -148,6 +189,7 @@ func buildChannelGroupItems(cfg *config.Config, auths []*coreauth.Auth) []channe
 		item.Priority = group.Priority
 		item.AllowedModels = append(item.AllowedModels, group.AllowedModels...)
 		item.Prefixes = append(item.Prefixes, group.Match.Prefixes...)
+		item.Tags = append(item.Tags, group.Match.Tags...)
 		configuredChannelsByGroup[item.Name] = append(configuredChannelsByGroup[item.Name], group.Match.Channels...)
 	}
 
@@ -183,6 +225,9 @@ func buildChannelGroupItems(cfg *config.Config, auths []*coreauth.Auth) []channe
 					}
 				}
 			}
+			if !matched && channelMatchesAnyTag(channel, group.Tags) {
+				matched = true
+			}
 			if !matched {
 				if group.Name == "default" && prefix == "" && includeDefault {
 					matched = true
@@ -196,6 +241,7 @@ func buildChannelGroupItems(cfg *config.Config, auths []*coreauth.Auth) []channe
 					Name:              channelName,
 					Source:            channel.Source,
 					Disabled:          channel.Disabled,
+					disabledAuthority: channel.DisabledAuthority,
 					DefaultTags:       append([]string{}, channel.DefaultTags...),
 					CustomTags:        append([]string{}, channel.CustomTags...),
 					HiddenDefaultTags: append([]string{}, channel.HiddenDefaultTags...),
@@ -209,6 +255,7 @@ func buildChannelGroupItems(cfg *config.Config, auths []*coreauth.Auth) []channe
 	for name, item := range groupMap {
 		item.Name = name
 		item.Prefixes = uniqueSortedStrings(item.Prefixes, internalrouting.NormalizeGroupName)
+		item.Tags = uniqueSortedStrings(item.Tags, config.NormalizeRoutingTag)
 		item.Channels = uniqueSortedStrings(item.Channels, func(value string) string { return strings.TrimSpace(value) })
 		item.ChannelDetails = uniqueSortedChannelDetails(item.ChannelDetails)
 		item.PathRoutes = uniqueSortedStrings(knownPaths[name], internalrouting.NormalizeNamespacePath)
@@ -216,6 +263,28 @@ func buildChannelGroupItems(cfg *config.Config, auths []*coreauth.Auth) []channe
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return out
+}
+
+func channelMatchesAnyTag(channel channelDescriptor, tags []string) bool {
+	if len(tags) == 0 {
+		return false
+	}
+	displayTags := make(map[string]struct{}, len(channel.DisplayTags))
+	for _, tag := range channel.DisplayTags {
+		normalized := config.NormalizeRoutingTag(tag)
+		if normalized != "" {
+			displayTags[normalized] = struct{}{}
+		}
+	}
+	if len(displayTags) == 0 {
+		return false
+	}
+	for _, tag := range tags {
+		if _, ok := displayTags[config.NormalizeRoutingTag(tag)]; ok {
+			return true
+		}
+	}
+	return false
 }
 
 func uniqueSortedStrings(values []string, normalizer func(string) string) []string {
@@ -391,6 +460,9 @@ func channelGroupMatchesAnyDescriptor(group config.RoutingChannelGroup, descript
 			if channel != "" && strings.EqualFold(strings.TrimSpace(candidateChannel), channel) {
 				return true
 			}
+		}
+		if channelMatchesAnyTag(descriptor, group.Match.Tags) {
+			return true
 		}
 	}
 	return false

@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
@@ -1181,13 +1182,18 @@ func (h *Handler) DeleteAuthFile(c *gin.Context) {
 					full = abs
 				}
 			}
+			deletedChannels := deletedAuthChannelIdentifiers(h.findAuthByNameOrID(name))
 			if err = os.Remove(full); err == nil {
 				if errDel := h.deleteTokenRecord(ctx, full); errDel != nil {
 					c.JSON(500, gin.H{"error": errDel.Error()})
 					return
 				}
 				deleted++
-				h.disableAuth(ctx, full)
+				h.removeAuth(ctx, full)
+				if errCleanup := h.removeChannelReferences(deletedChannels); errCleanup != nil {
+					c.JSON(500, gin.H{"error": errCleanup.Error()})
+					return
+				}
 			}
 		}
 		c.JSON(200, gin.H{"status": "ok", "deleted": deleted})
@@ -1204,6 +1210,7 @@ func (h *Handler) DeleteAuthFile(c *gin.Context) {
 			full = abs
 		}
 	}
+	deletedChannels := deletedAuthChannelIdentifiers(h.findAuthByNameOrID(name))
 	if err := os.Remove(full); err != nil {
 		if os.IsNotExist(err) {
 			c.JSON(404, gin.H{"error": "file not found"})
@@ -1216,8 +1223,48 @@ func (h *Handler) DeleteAuthFile(c *gin.Context) {
 		c.JSON(500, gin.H{"error": err.Error()})
 		return
 	}
-	h.disableAuth(ctx, full)
+	h.removeAuth(ctx, full)
+	if err := h.removeChannelReferences(deletedChannels); err != nil {
+		c.JSON(500, gin.H{"error": err.Error()})
+		return
+	}
 	c.JSON(200, gin.H{"status": "ok"})
+}
+
+func (h *Handler) findAuthByNameOrID(name string) *coreauth.Auth {
+	if h == nil || h.authManager == nil {
+		return nil
+	}
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return nil
+	}
+	if auth, ok := h.authManager.GetByID(name); ok {
+		return auth
+	}
+	for _, auth := range h.authManager.List() {
+		if auth == nil {
+			continue
+		}
+		if strings.EqualFold(strings.TrimSpace(auth.FileName), name) {
+			return auth
+		}
+		if path := strings.TrimSpace(authAttribute(auth, "path")); path != "" && strings.EqualFold(filepath.Base(path), name) {
+			return auth
+		}
+	}
+	return nil
+}
+
+func deletedAuthChannelIdentifiers(auth *coreauth.Auth) []string {
+	if auth == nil {
+		return nil
+	}
+	accountType, _ := auth.AccountInfo()
+	if !strings.EqualFold(accountType, "oauth") {
+		return nil
+	}
+	return auth.ChannelIdentifiers()
 }
 
 func (h *Handler) authIDForPath(path string) string {
@@ -1273,9 +1320,17 @@ func (h *Handler) registerAuthFromFile(ctx context.Context, path string, data []
 	if err := json.Unmarshal(data, &metadata); err != nil {
 		return fmt.Errorf("invalid auth file: %w", err)
 	}
-	provider, _ := metadata["type"].(string)
-	if provider == "" {
-		provider = "unknown"
+	provider := sdkAuth.InferAuthProvider(metadata)
+	normalized := sdkAuth.NormalizeAuthMetadata(metadata, provider)
+	if !reflect.DeepEqual(metadata, normalized) {
+		metadata = normalized
+		normalizedData, errMarshal := json.Marshal(metadata)
+		if errMarshal != nil {
+			return fmt.Errorf("failed to normalize auth file: %w", errMarshal)
+		}
+		if errWrite := os.WriteFile(path, normalizedData, 0o600); errWrite != nil {
+			return fmt.Errorf("failed to write normalized auth file: %w", errWrite)
+		}
 	}
 	label := authChannelLabelFromMetadata(metadata, provider)
 	lastRefresh, hasLastRefresh := extractLastRefreshTimestamp(metadata)
@@ -1643,23 +1698,31 @@ func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"status": "ok"})
 }
 
-func (h *Handler) disableAuth(ctx context.Context, id string) {
+func (h *Handler) removeAuth(ctx context.Context, id string) {
 	if h == nil || h.authManager == nil {
 		return
 	}
-	authID := h.authIDForPath(id)
-	if authID == "" {
-		authID = strings.TrimSpace(id)
+	candidates := []string{
+		h.authIDForPath(id),
+		strings.TrimSpace(id),
+		filepath.Base(strings.TrimSpace(id)),
 	}
-	if authID == "" {
-		return
+	seen := make(map[string]struct{}, len(candidates))
+	for _, candidate := range candidates {
+		candidate = strings.TrimSpace(candidate)
+		if candidate == "" || candidate == "." {
+			continue
+		}
+		if _, ok := seen[candidate]; ok {
+			continue
+		}
+		seen[candidate] = struct{}{}
+		if deleted, _ := h.authManager.Delete(coreauth.WithSkipPersist(ctx), candidate); deleted != nil {
+			return
+		}
 	}
-	if auth, ok := h.authManager.GetByID(authID); ok {
-		auth.Disabled = true
-		auth.Status = coreauth.StatusDisabled
-		auth.StatusMessage = "removed via management API"
-		auth.UpdatedAt = time.Now()
-		_, _ = h.authManager.Update(ctx, auth)
+	if auth := h.findAuthByNameOrID(filepath.Base(strings.TrimSpace(id))); auth != nil {
+		_, _ = h.authManager.Delete(coreauth.WithSkipPersist(ctx), auth.ID)
 	}
 }
 
